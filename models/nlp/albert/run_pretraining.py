@@ -412,9 +412,21 @@ def main():
 
     gpus = tf.config.list_physical_devices("GPU")
     for gpu in gpus:
-        tf.config.experimental.set_memory_growth(gpu, True)
+       tf.config.experimental.set_memory_growth(gpu, False)
     if gpus:
         tf.config.set_visible_devices(gpus[smddp.local_rank()], "GPU")
+    # if gpus:
+        # Create 1 virtual GPUs with 24GB memory
+        try:
+            tf.config.experimental.set_virtual_device_configuration(
+                gpus[smddp.local_rank()],
+                [tf.config.experimental.VirtualDeviceConfiguration(memory_limit=31*1024)])
+            logical_gpus = tf.config.experimental.list_logical_devices('GPU')
+            print(len(gpus), "Physical GPU,", len(logical_gpus), "Logical GPUs")
+        except RuntimeError as e:
+            # Virtual devices must be set before GPUs have been initialized
+            print(e)
+
     # XLA, AutoGraph
     tf.config.optimizer.set_jit(do_xla)
     tf.config.experimental_run_functions_eagerly(do_eager)
