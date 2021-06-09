@@ -230,6 +230,37 @@ def allreduce(model, optimizer, gradient_accumulator, loss, mlm_loss, mlm_acc, s
 
     return loss, mlm_loss, mlm_acc, sop_loss, sop_acc, grad_norm, weight_norm
 
+class SMDP_Keras_Bert(keras.Model):
+    def __init__(self, model_args):
+        super(SMDP_Keras_Bert, self).__init__()
+        self.model = create_model(model_class=TFAutoModelForPreTraining, model_args=model_args)
+
+    @tf.function()
+    def train_step(self, data):
+        input_dict = {
+            "input_ids": data["input_ids"],
+            "attention_mask": data["input_mask"],
+            "token_type_ids": data["segment_ids"],
+        }
+        scaled_grads, loss, mlm_loss, mlm_acc, sop_loss, sop_acc, mlm_logits = self.get_grads(
+            input_dict,
+            data["masked_lm_positions"],
+            data["masked_lm_ids"],
+            data["masked_lm_weights"],
+            data["next_sentence_labels"],
+            False,
+            False
+        )
+
+        scaled_grads = [g.accumulate() for g in scaled_grads]
+
+        self.optimizer.apply_gradients(zip(scaled_grads, self.trainable_variables))
+
+        return {"loss": loss.reduce_mean(),
+            "mlm_loss": mlm_loss.reduce_mean(),
+            "mlm_acc": mlm_acc.reduce_mean(),
+            "sop_loss": sop_loss.reduce_mean(),
+            "sop_acc": sop_acc.reduce_mean()}
 
 # The bottleneck is here, since each node has 10 GiB/s PCI throughput, accumulating the gradients
 # on the CPU. If there's a way to accumulate gradients on the GPU without getting OOM, let's find it!
@@ -370,6 +401,40 @@ def get_checkpoint_paths_from_prefix(prefix: str) -> Tuple[str, str]:
     return f"{prefix}.ckpt", f"{prefix}-optimizer.npy"
 
 
+# define call back for measuring time
+class TimingAndLossCallback(tf.keras.callbacks.Callback):
+    def on_train_begin(self, logs=None):
+        self.start_time_with_preproc = time.time()
+        self.mean_train_loss = tf.keras.metrics.Mean(name="mean_train_loss")
+        self.first_epoch = True
+        self.train_duration = float("inf")
+        self.train_duration_with_preproc = float("inf")
+        self.final_loss = float("inf")
+
+    def on_train_end(self, logs=None):
+        elapsed_time = time.time()
+        self.train_duration = elapsed_time - self.start_time
+        self.train_duration_with_preproc = elapsed_time - self.start_time_with_preproc
+
+    def on_epoch_begin(self, epoch, logs=None):
+        if epoch > 1:
+            self.first_epoch = False
+        self.mean_train_loss.reset_states()
+        self.epoch_start_time = time.time()
+
+    def on_epoch_end(self, epoch, logs=None):
+        epoch_duration = time.time() - self.epoch_start_time
+        print(f"Epoch duration is {epoch_duration: .3f}")
+        self.final_loss = self.mean_train_loss.result()
+
+    def on_train_batch_begin(self, batch, logs=None):
+        if batch == 1 and self.first_epoch:
+            self.start_time = time.time()
+
+    def on_train_batch_end(self, batch, logs=None):
+        self.mean_train_loss(logs["loss"])
+
+
 def main():
     parser = HfArgumentParser(
         (ModelArguments, DataTrainingArguments, TrainingArguments, LoggingArguments, PathArguments)
@@ -419,6 +484,7 @@ def main():
     tf.config.optimizer.set_jit(do_xla)
     tf.config.experimental_run_functions_eagerly(do_eager)
 
+    smddp.overlap(10)
     if smddp.rank() == 0:
         # Run name should only be used on one process to avoid race conditions
         current_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -485,7 +551,7 @@ def main():
 
     loaded_optimizer_weights = None
 
-    model = create_model(model_class=TFAutoModelForPreTraining, model_args=model_args)
+    model = SMDP_Keras_Bert(model_args)
     tokenizer = create_tokenizer(model_args.model_type)
     if model_args.load_from == "checkpoint":
         checkpoint_path = os.path.join(path_args.filesystem_prefix, model_args.checkpoint_path)
@@ -533,6 +599,8 @@ def main():
         logger.info(f"Starting training, job name {run_name}")
 
     i = 1
+
+    
     start_time = time.perf_counter()
     train_start_time = time.perf_counter()
     for batch in train_dataset:
